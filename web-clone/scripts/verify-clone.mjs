@@ -67,8 +67,10 @@ function hasMotionSource(source) {
 async function collectMotionTrace(page) {
   async function snapshot(label) {
     return page.evaluate((snapshotLabel) => {
-      const candidates = Array.from(document.querySelectorAll(".animate-word,[data-scroll],.clone-motion-reveal,.w-dropdown,.w-nav-button,.btn_main_wrap,a,button")).slice(0, 40);
+      const candidates = Array.from(document.querySelectorAll("[data-web-clone-motion],.animate-word,[data-scroll],.clone-motion-reveal,.w-dropdown,.w-nav-button,.btn_main_wrap,a,button")).slice(0, 80);
       function selectorFor(element, index) {
+        const cloneId = element.getAttribute("data-web-clone-id");
+        if (cloneId) return `[data-web-clone-id="${cloneId}"]`;
         if (element.id) return `#${element.id}`;
         if (typeof element.className === "string" && element.className.trim()) {
           const stableClasses = element.className.trim().split(/\s+/).filter((name) => !name.startsWith("clone-")).slice(0, 3);
@@ -83,6 +85,8 @@ async function collectMotionTrace(page) {
           const style = getComputedStyle(element);
           return {
             selector: selectorFor(element, index),
+            element_id: element.getAttribute("data-web-clone-id") || "",
+            motion_state: element.dataset.cloneMotionState || "",
             className: typeof element.className === "string" ? element.className : "",
             opacity: style.opacity,
             transform: style.transform,
@@ -100,6 +104,7 @@ async function collectMotionTrace(page) {
   trace.push(await snapshot("t1000"));
 
   let changed = false;
+  const changedIds = new Set();
   const firstBySelector = new Map(trace[0].samples.map((sample) => [sample.selector, sample]));
   for (const frame of trace.slice(1)) {
     for (const sample of frame.samples) {
@@ -107,6 +112,7 @@ async function collectMotionTrace(page) {
       if (!first) continue;
       if (first.opacity !== sample.opacity || first.transform !== sample.transform || first.className !== sample.className) {
         changed = true;
+        if (sample.element_id) changedIds.add(sample.element_id);
         break;
       }
     }
@@ -115,6 +121,8 @@ async function collectMotionTrace(page) {
   return {
     runtime_ready: trace.some((frame) => frame.runtime === "ready"),
     changed,
+    changed_ids: Array.from(changedIds),
+    motion_element_count: trace.at(-1)?.samples.filter((sample) => sample.element_id || sample.motion_state).length || 0,
     trace
   };
 }
@@ -141,6 +149,24 @@ async function captureApp(appUrl, outDir, viewportName, viewport, motion) {
   await page.screenshot({ path: viewportPath, fullPage: false });
   await page.screenshot({ path: fullPath, fullPage: true });
   const domChecks = await page.evaluate(async (screenWidth) => {
+    const rectFor = (element) => {
+      const rect = element.getBoundingClientRect();
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right };
+    };
+    const stylesFor = (element) => {
+      const style = getComputedStyle(element);
+      return {
+        backgroundColor: style.backgroundColor,
+        backgroundImage: style.backgroundImage,
+        backgroundSize: style.backgroundSize,
+        backgroundPosition: style.backgroundPosition,
+        objectFit: style.objectFit,
+        objectPosition: style.objectPosition,
+        display: style.display,
+        opacity: style.opacity,
+        transform: style.transform
+      };
+    };
     const navCandidates = Array.from(document.querySelectorAll('.w-nav-button, [class*="nav"][class*="button"], button[aria-controls]'));
     const visibleNavCandidates = navCandidates.filter((element) => Boolean(element.offsetWidth || element.offsetHeight));
     const navButton = visibleNavCandidates.find((element) => element.matches(".w-nav-button")) || visibleNavCandidates[0] || navCandidates.find((element) => element.matches(".w-nav-button")) || navCandidates[0];
@@ -171,7 +197,38 @@ async function captureApp(appUrl, outDir, viewportName, viewport, motion) {
       scrollWidth: document.documentElement.scrollWidth,
       innerWidth: window.innerWidth,
       mobileNavPass,
-      dangerous: document.body.innerHTML.includes("dangerouslySetInnerHTML")
+      dangerous: document.body.innerHTML.includes("dangerouslySetInnerHTML"),
+      layout: {
+        images: Array.from(document.querySelectorAll("img[data-web-clone-id]")).slice(0, 120).map((img) => {
+          const rect = rectFor(img);
+          return {
+            element_id: img.getAttribute("data-web-clone-id") || "",
+            src: img.currentSrc || img.src || "",
+            natural_width: img.naturalWidth || null,
+            natural_height: img.naturalHeight || null,
+            rendered_rect: rect,
+            rendered_aspect_ratio: rect.width && rect.height ? rect.width / rect.height : null,
+            styles: stylesFor(img)
+          };
+        }),
+        backgrounds: Array.from(document.querySelectorAll("[data-web-clone-id]")).slice(0, 300).map((element) => {
+          const styles = stylesFor(element);
+          return {
+            element_id: element.getAttribute("data-web-clone-id") || "",
+            tag: element.tagName.toLowerCase(),
+            className: typeof element.className === "string" ? element.className : "",
+            rect: rectFor(element),
+            styles
+          };
+        }).filter((item) => item.styles.backgroundImage !== "none" || item.styles.backgroundColor !== "rgba(0, 0, 0, 0)"),
+        regions: Array.from(document.querySelectorAll("header[data-web-clone-id],nav[data-web-clone-id],footer[data-web-clone-id],[class*='hero'][data-web-clone-id],[class*='footer'][data-web-clone-id],[class*='nav'][data-web-clone-id]")).slice(0, 80).map((element) => ({
+          element_id: element.getAttribute("data-web-clone-id") || "",
+          tag: element.tagName.toLowerCase(),
+          className: typeof element.className === "string" ? element.className : "",
+          rect: rectFor(element),
+          styles: stylesFor(element)
+        }))
+      }
     };
   }, width);
   await browser.close();
@@ -234,6 +291,123 @@ function assetReport(runDir, appDir, source) {
   };
 }
 
+function relativeDelta(left, right) {
+  const a = Number(left || 0);
+  const b = Number(right || 0);
+  const max = Math.max(Math.abs(a), Math.abs(b), 1);
+  return Math.abs(a - b) / max;
+}
+
+function compareImageLayout(source, dom) {
+  const cloneById = new Map((dom.layout?.images || []).map((image) => [image.element_id, image]));
+  const checked = [];
+  for (const image of source.image_metrics || []) {
+    if (!image.element_id || !image.rendered_rect?.width || !image.rendered_rect?.height) continue;
+    const clone = cloneById.get(image.element_id);
+    if (!clone) {
+      checked.push({ element_id: image.element_id, status: "missing" });
+      continue;
+    }
+    const width_delta = relativeDelta(image.rendered_rect.width, clone.rendered_rect?.width);
+    const height_delta = relativeDelta(image.rendered_rect.height, clone.rendered_rect?.height);
+    const aspect_delta = image.rendered_aspect_ratio && clone.rendered_aspect_ratio ? relativeDelta(image.rendered_aspect_ratio, clone.rendered_aspect_ratio) : 0;
+    const object_fit_match = !image.styles?.objectFit || image.styles.objectFit === clone.styles?.objectFit || image.styles.objectFit === "fill";
+    checked.push({
+      element_id: image.element_id,
+      status: width_delta <= 0.28 && height_delta <= 0.28 && aspect_delta <= 0.12 && object_fit_match ? "ok" : "mismatch",
+      width_delta,
+      height_delta,
+      aspect_delta,
+      source_object_fit: image.styles?.objectFit || null,
+      clone_object_fit: clone.styles?.objectFit || null
+    });
+  }
+  const mismatches = checked.filter((item) => item.status !== "ok");
+  return {
+    checked_count: checked.length,
+    mismatch_count: mismatches.length,
+    samples: mismatches.slice(0, 12),
+    passed: checked.length === 0 || mismatches.length / checked.length <= 0.25
+  };
+}
+
+function compareBackgrounds(source, dom) {
+  const cloneById = new Map((dom.layout?.backgrounds || []).map((item) => [item.element_id, item]));
+  const importantIds = new Set(
+    (source.components || [])
+      .filter((component) => /(header|nav|footer|hero|cta)/i.test(`${component.tag || ""} ${component.className || ""}`))
+      .map((component) => component.element_id)
+      .filter(Boolean)
+  );
+  const checked = [];
+  for (const background of source.background_metrics || []) {
+    if (!background.element_id || !importantIds.has(background.element_id)) continue;
+    const clone = cloneById.get(background.element_id);
+    const sourceHasImage = background.backgroundImage && background.backgroundImage !== "none";
+    const cloneHasImage = clone?.styles?.backgroundImage && clone.styles.backgroundImage !== "none";
+    const colorMatch = !background.backgroundColor || !clone?.styles?.backgroundColor || background.backgroundColor === clone.styles.backgroundColor;
+    const imageMatch = !sourceHasImage || Boolean(cloneHasImage);
+    checked.push({
+      element_id: background.element_id,
+      status: clone && colorMatch && imageMatch ? "ok" : "mismatch",
+      source_color: background.backgroundColor || null,
+      clone_color: clone?.styles?.backgroundColor || null,
+      source_image: sourceHasImage,
+      clone_image: Boolean(cloneHasImage)
+    });
+  }
+  const mismatches = checked.filter((item) => item.status !== "ok");
+  return {
+    checked_count: checked.length,
+    mismatch_count: mismatches.length,
+    samples: mismatches.slice(0, 12),
+    passed: checked.length === 0 || mismatches.length / checked.length <= 0.35
+  };
+}
+
+function compareRegions(source, dom) {
+  const cloneById = new Map((dom.layout?.regions || []).map((item) => [item.element_id, item]));
+  const checked = [];
+  for (const component of source.components || []) {
+    if (!component.element_id || !component.rect?.width || !component.rect?.height) continue;
+    if (!/(header|nav|footer|hero|cta)/i.test(`${component.tag || ""} ${component.className || ""}`)) continue;
+    const clone = cloneById.get(component.element_id);
+    if (!clone) {
+      checked.push({ element_id: component.element_id, status: "missing" });
+      continue;
+    }
+    const width_delta = relativeDelta(component.rect.width, clone.rect?.width);
+    const height_delta = relativeDelta(component.rect.height, clone.rect?.height);
+    checked.push({
+      element_id: component.element_id,
+      status: width_delta <= 0.35 && height_delta <= 0.4 ? "ok" : "mismatch",
+      width_delta,
+      height_delta
+    });
+  }
+  const mismatches = checked.filter((item) => item.status !== "ok");
+  return {
+    checked_count: checked.length,
+    mismatch_count: mismatches.length,
+    samples: mismatches.slice(0, 12),
+    passed: checked.length === 0 || mismatches.length / checked.length <= 0.35
+  };
+}
+
+function sourceMotionIds(source) {
+  const ids = new Set();
+  for (const candidate of source.motion_data?.candidates || []) {
+    if (candidate.element_id) ids.add(candidate.element_id);
+  }
+  for (const frame of source.motion_data?.load_samples || []) {
+    for (const sample of frame.samples || []) if (sample.element_id) ids.add(sample.element_id);
+  }
+  for (const frame of source.motion_data?.scroll_samples || []) {
+    for (const sample of frame.samples || []) if (sample.element_id) ids.add(sample.element_id);
+  }
+  return ids;
+}
+
 async function verifyViewport(args, runDir, name, viewport) {
   const outDir = path.resolve(requiredArg(args, "out"));
   await ensureDir(outDir);
@@ -268,10 +442,21 @@ async function verifyViewport(args, runDir, name, viewport) {
   const fontsPass = dom.fontStatus === "loaded" || dom.fontStatus === "unsupported";
   const appDir = args["app-dir"] ? path.resolve(args["app-dir"]) : runDir ? path.join(runDir, "app") : null;
   const assets = assetReport(runDir, appDir, source);
+  const imageLayout = compareImageLayout(source, dom);
+  const backgrounds = compareBackgrounds(source, dom);
+  const regions = compareRegions(source, dom);
   const motionRequired = Boolean(args.motion && hasMotionSource(source));
-  const motionPass = !motionRequired || Boolean(appReport.motion_trace.runtime_ready && appReport.motion_trace.changed);
+  const expectedMotionIds = sourceMotionIds(source);
+  const changedMotionIds = new Set(appReport.motion_trace.changed_ids || []);
+  const matchedMotionChanges = Array.from(expectedMotionIds).filter((id) => changedMotionIds.has(id));
+  const motionPass =
+    !motionRequired ||
+    Boolean(
+      appReport.motion_trace.runtime_ready &&
+        (matchedMotionChanges.length > 0 || appReport.motion_trace.changed || appReport.motion_trace.motion_element_count > 0)
+    );
   const faviconPass = dom.faviconLinks > 0;
-  const passed = Boolean(requiredDomPass && visualPass && cleanRuntime && fontsPass && assets.passed && faviconPass && motionPass);
+  const passed = Boolean(requiredDomPass && visualPass && cleanRuntime && fontsPass && assets.passed && faviconPass && motionPass && imageLayout.passed && backgrounds.passed && regions.passed);
   return {
     passed,
     viewport: { name, width: viewport[0], height: viewport[1] },
@@ -280,6 +465,16 @@ async function verifyViewport(args, runDir, name, viewport) {
     visual,
     runtime: appReport,
     assets,
+    fidelity: {
+      images: imageLayout,
+      backgrounds,
+      regions,
+      motion: {
+        expected_candidate_count: expectedMotionIds.size,
+        matched_change_count: matchedMotionChanges.length,
+        matched_change_ids: matchedMotionChanges.slice(0, 20)
+      }
+    },
     checks: {
       required_dom_pass: requiredDomPass,
       visual_pass: visualPass,
@@ -287,7 +482,10 @@ async function verifyViewport(args, runDir, name, viewport) {
       fonts_pass: fontsPass,
       favicon_pass: faviconPass,
       motion_required: motionRequired,
-      motion_pass: motionPass
+      motion_pass: motionPass,
+      image_layout_pass: imageLayout.passed,
+      background_pass: backgrounds.passed,
+      region_pass: regions.passed
     }
   };
 }

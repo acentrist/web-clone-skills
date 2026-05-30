@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   copyDir,
   ensureDir,
+  generateFidelityCss,
   generateRuntimeSource,
   htmlToJsx,
   parseArgs,
@@ -31,8 +32,10 @@ async function assembleViteApp(runDir, outputDir, projectName) {
 
   const imports = [];
   const renders = [];
+  const contracts = [];
   for (const component of integration.components) {
     const contract = await readJson(path.join(contractsDir, "contracts", `${component.namespace}.json`));
+    contracts.push(contract);
     const componentName = contract.component_name;
     const componentDir = path.join(outputDir, "src", "components", "sections", contract.namespace);
     await ensureDir(componentDir);
@@ -42,7 +45,7 @@ async function assembleViteApp(runDir, outputDir, projectName) {
       path.join(componentDir, `${componentName}.jsx`),
       `import "./${cssFile}";\n\nexport default function ${componentName}() {\n  return (\n    <>\n${indent(jsx, 6)}\n    </>\n  );\n}\n`
     );
-    await writeText(path.join(componentDir, cssFile), `/* Section-specific refinements for ${componentName}. Keep source classes intact. */\n`);
+    await writeText(path.join(componentDir, cssFile), contract.fidelity_css || `/* No section-specific fidelity corrections for ${componentName}. */\n`);
     imports.push(`import ${componentName} from "${component.import_path}";`);
     renders.push(`      <${componentName} />`);
   }
@@ -53,22 +56,26 @@ async function assembleViteApp(runDir, outputDir, projectName) {
   );
   await writeText(
     path.join(outputDir, "src", "main.jsx"),
-    `import React from "react";\nimport { createRoot } from "react-dom/client";\nimport App from "./App.jsx";\nimport "./index.css";\nimport "./styles/original.css";\nimport { initCloneRuntime } from "./runtime/cloneRuntime.js";\n\ncreateRoot(document.getElementById("root")).render(\n  <React.StrictMode>\n    <App />\n  </React.StrictMode>\n);\n\nrequestAnimationFrame(() => {\n  initCloneRuntime();\n  window.setTimeout(initCloneRuntime, 250);\n});\n`
+    `import React from "react";\nimport { createRoot } from "react-dom/client";\nimport App from "./App.jsx";\nimport "./index.css";\nimport "./styles/original.css";\nimport "./styles/fidelity.css";\nimport { initCloneRuntime } from "./runtime/cloneRuntime.js";\nimport { motionManifest } from "./runtime/motionManifest.js";\n\ncreateRoot(document.getElementById("root")).render(\n  <React.StrictMode>\n    <App />\n  </React.StrictMode>\n);\n\nrequestAnimationFrame(() => {\n  initCloneRuntime(motionManifest);\n  window.setTimeout(() => initCloneRuntime(motionManifest), 250);\n});\n`
   );
   await writeText(path.join(outputDir, "src", "runtime", "cloneRuntime.js"), generateRuntimeSource());
+  await writeText(path.join(outputDir, "src", "runtime", "motionManifest.js"), `export const motionManifest = ${JSON.stringify(shared.motion_manifest || { items: [] }, null, 2)};\n`);
   await writeText(
     path.join(outputDir, "src", "index.css"),
-    `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n:root {\n  color-scheme: light;\n}\n\n* {\n  box-sizing: border-box;\n}\n\nhtml,\nbody,\n#root {\n  margin: 0;\n  min-height: 100%;\n}\n\nbody {\n  overflow-x: clip;\n}\n\nimg,\nsvg,\nvideo,\ncanvas {\n  max-width: 100%;\n}\n\n.clone-page {\n  min-height: 100vh;\n}\n`
+    `@tailwind components;\n@tailwind utilities;\n\n:root {\n  color-scheme: light;\n}\n\n* {\n  box-sizing: border-box;\n}\n\nhtml,\nbody,\n#root {\n  margin: 0;\n  min-height: 100%;\n}\n\nbody {\n  overflow-x: clip;\n}\n\nimg,\nsvg,\nvideo,\ncanvas {\n  max-width: 100%;\n}\n\n.clone-page {\n  min-height: 100vh;\n}\n`
   );
   await writeText(
     path.join(outputDir, "src", "styles", "original.css"),
     `${shared.original_css || ""}\n/* web-clone fidelity defaults */\n.clone-page h1 a {\n  text-decoration-line: underline;\n  text-decoration-thickness: 0.08em;\n  text-underline-offset: 0.1em;\n}\n`
   );
+  await writeText(path.join(outputDir, "src", "styles", "fidelity.css"), generateFidelityCss(shared, contracts));
 
   const faviconHead = buildFaviconHead(shared, assetMap, integration.source_url);
+  const htmlAttrs = buildRootAttrs(shared.document_state?.html, { lang: shared.document_state?.html?.lang || "en" }, assetMap, integration.source_url);
+  const bodyAttrs = buildRootAttrs(shared.document_state?.body, {}, assetMap, integration.source_url);
   await writeText(
     path.join(outputDir, "index.html"),
-    `<!doctype html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>${escapeHtml(shared.title || "Cloned Website")}</title>\n${faviconHead}\n  </head>\n  <body>\n    <div id="root"></div>\n    <script type="module" src="/src/main.jsx"></script>\n  </body>\n</html>\n`
+    `<!doctype html>\n<html${htmlAttrs}>\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>${escapeHtml(shared.title || "Cloned Website")}</title>\n${faviconHead}\n  </head>\n  <body${bodyAttrs}>\n    <div id="root"></div>\n    <script type="module" src="/src/main.jsx"></script>\n  </body>\n</html>\n`
   );
   await writeJson(path.join(outputDir, "package.json"), {
     name: safePackageName(projectName),
@@ -94,7 +101,7 @@ async function assembleViteApp(runDir, outputDir, projectName) {
   });
   await writeText(path.join(outputDir, "vite.config.js"), `import { defineConfig } from "vite";\nimport react from "@vitejs/plugin-react";\n\nexport default defineConfig({\n  plugins: [react()],\n});\n`);
   await writeText(path.join(outputDir, "postcss.config.js"), `export default {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n};\n`);
-  await writeText(path.join(outputDir, "tailwind.config.js"), `export default {\n  content: ["./index.html", "./src/**/*.{js,jsx,ts,tsx}"],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n};\n`);
+  await writeText(path.join(outputDir, "tailwind.config.js"), `export default {\n  content: ["./index.html", "./src/**/*.{js,jsx,ts,tsx}"],\n  corePlugins: {\n    preflight: false,\n  },\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n};\n`);
   await writeText(path.join(outputDir, ".gitignore"), "node_modules\ndist\n.env*\n*.log\n");
   return { sections: integration.components.length };
 }
@@ -128,6 +135,35 @@ function buildFaviconHead(shared, assetMap, baseUrl) {
   if (shared.favicon?.theme_color) lines.push(`    <meta name="theme-color" content="${escapeHtml(shared.favicon.theme_color)}" />`);
   if (shared.favicon?.application_name) lines.push(`    <meta name="application-name" content="${escapeHtml(shared.favicon.application_name)}" />`);
   return lines.join("\n");
+}
+
+function buildRootAttrs(state, defaults = {}, assetMap = {}, baseUrl = "") {
+  const attrs = { ...defaults, ...(state?.attrs || {}) };
+  if (state?.className) attrs.class = state.className;
+  const parts = [];
+  for (const [rawName, rawValue] of Object.entries(attrs)) {
+    const name = String(rawName || "").toLowerCase();
+    if (!name || name.startsWith("on") || ["srcdoc"].includes(name)) continue;
+    let value = rawValue ?? "";
+    if (name === "style") value = rewriteStyleUrls(value, assetMap, baseUrl);
+    if (value === "") parts.push(escapeHtml(rawName));
+    else parts.push(`${escapeHtml(rawName)}="${escapeHtml(value)}"`);
+  }
+  return parts.length ? ` ${parts.join(" ")}` : "";
+}
+
+function rewriteStyleUrls(value, assetMap, baseUrl) {
+  let result = String(value || "");
+  for (const [original, local] of Object.entries(assetMap || {})) result = result.split(original).join(local);
+  result = result.replace(/url\(["']?([^"')\s]+)["']?\)/gi, (match, rawUrl) => {
+    try {
+      const normalized = new URL(rawUrl, baseUrl).toString();
+      return assetMap[normalized] ? `url("${assetMap[normalized]}")` : match;
+    } catch {
+      return match;
+    }
+  });
+  return result;
 }
 
 async function main() {

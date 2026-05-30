@@ -408,18 +408,314 @@ function balanceCssBraces(css) {
   return css;
 }
 
-function createMotionContract(source) {
+const FIDELITY_LAYOUT_PROPS = [
+  "display",
+  "position",
+  "top",
+  "right",
+  "bottom",
+  "left",
+  "zIndex",
+  "maxWidth",
+  "minWidth",
+  "minHeight",
+  "margin",
+  "padding",
+  "fontFamily",
+  "fontSize",
+  "fontWeight",
+  "lineHeight",
+  "letterSpacing",
+  "color",
+  "backgroundColor",
+  "backgroundImage",
+  "backgroundSize",
+  "backgroundPosition",
+  "backgroundRepeat",
+  "backgroundAttachment",
+  "border",
+  "borderColor",
+  "borderWidth",
+  "borderStyle",
+  "borderRadius",
+  "boxShadow",
+  "overflow",
+  "overflowX",
+  "overflowY",
+  "flexDirection",
+  "flexWrap",
+  "justifyContent",
+  "alignItems",
+  "alignContent",
+  "gridTemplateColumns",
+  "gridTemplateRows",
+  "gap",
+  "rowGap",
+  "columnGap",
+  "textAlign",
+  "textTransform",
+  "whiteSpace",
+  "filter",
+  "clipPath"
+];
+
+const FIDELITY_IMAGE_PROPS = ["width", "height", "maxWidth", "maxHeight", "aspectRatio", "objectFit", "objectPosition", "display"];
+const MOTION_STYLE_PROPS = ["opacity", "transform", "filter", "clipPath", "visibility", "display", "backgroundColor", "color", "borderColor", "boxShadow"];
+
+function pickProps(styles = {}, props = FIDELITY_LAYOUT_PROPS) {
+  const output = {};
+  for (const prop of props) {
+    const value = styles[prop];
+    if (value === undefined || value === null || value === "" || value === "normal" || value === "none 0s ease 0s") continue;
+    output[prop] = value;
+  }
+  return output;
+}
+
+function createElementIndex(root) {
+  const byId = new Map();
+  const visit = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (node.element_id) byId.set(node.element_id, node);
+    for (const child of node.children || []) visit(child);
+  };
+  visit(root);
+  return byId;
+}
+
+function idsForSection($, element) {
+  const ids = new Set();
+  const rootId = $(element).attr("data-web-clone-id");
+  if (rootId) ids.add(rootId);
+  $("[data-web-clone-id]", element).each((_, child) => ids.add($(child).attr("data-web-clone-id")));
+  return ids;
+}
+
+function compactRect(rect) {
+  if (!rect) return null;
+  return {
+    x: Number(rect.x || 0),
+    y: Number(rect.y || 0),
+    width: Number(rect.width || 0),
+    height: Number(rect.height || 0),
+    top: Number(rect.top ?? rect.y ?? 0),
+    left: Number(rect.left ?? rect.x ?? 0),
+    bottom: Number(rect.bottom ?? 0),
+    right: Number(rect.right ?? 0)
+  };
+}
+
+function createLayoutContract(section, ids, elementIndex) {
+  const important = [];
+  for (const id of ids) {
+    const node = elementIndex.get(id);
+    if (!node) continue;
+    const tag = node.tag || "";
+    const className = node.className || "";
+    const isImportant =
+      id === section.element_id ||
+      /^(header|nav|main|section|article|aside|footer|h1|h2|h3|a|button|img|picture|svg)$/i.test(tag) ||
+      /(hero|header|footer|nav|button|btn|cta|card|image|media|grid|layout|section)/i.test(className || "");
+    if (!isImportant) continue;
+    important.push({
+      element_id: id,
+      tag,
+      className,
+      id_attr: node.id || "",
+      text: node.text || "",
+      rect: compactRect(node.rect),
+      styles: pickProps(node.styles || {})
+    });
+  }
+  return {
+    root_element_id: section.element_id || null,
+    element_ids: Array.from(ids),
+    viewport: section.viewport || null,
+    important_elements: important.slice(0, 160)
+  };
+}
+
+function createImageContract(source, ids) {
+  const assetMap = assetMapFromSource(source);
+  return {
+    images: (source.image_metrics || [])
+      .filter((image) => ids.has(image.element_id))
+      .slice(0, 80)
+      .map((image) => ({
+        ...image,
+        local_src: assetMap[normalizeUrlValue(image.currentSrc || image.src || "", source.url)] || null,
+        styles: pickProps(image.styles || {}, FIDELITY_IMAGE_PROPS)
+      }))
+  };
+}
+
+function createBackgroundContract(source, ids) {
+  const assetMap = assetMapFromSource(source);
+  return {
+    backgrounds: (source.background_metrics || [])
+      .filter((item) => ids.has(item.element_id))
+      .slice(0, 120)
+      .map((item) => ({
+        ...item,
+        local_urls: (item.urls || []).map((url) => assetMap[normalizeUrlValue(url, source.url)] || null).filter(Boolean),
+        styles: pickProps(item, ["backgroundColor", "backgroundImage", "backgroundSize", "backgroundPosition", "backgroundRepeat", "backgroundAttachment"])
+      }))
+  };
+}
+
+function createPseudoContract(source, ids) {
+  return {
+    pseudo_elements: (source.pseudo_elements || [])
+      .filter((item) => ids.has(item.element_id))
+      .slice(0, 80)
+      .map((item) => ({
+        element_id: item.element_id,
+        pseudo: item.pseudo,
+        rect: compactRect(item.rect),
+        styles: pickProps(item.styles || {}, ["content", ...FIDELITY_LAYOUT_PROPS])
+      }))
+  };
+}
+
+function sampleMap(frame) {
+  return new Map((frame?.samples || []).filter((sample) => sample.element_id).map((sample) => [sample.element_id, sample]));
+}
+
+function styleDiff(before = {}, after = {}, props = MOTION_STYLE_PROPS) {
+  const diff = {};
+  for (const prop of props) {
+    if (before[prop] !== after[prop] && after[prop] !== undefined && after[prop] !== null) diff[prop] = after[prop];
+  }
+  return diff;
+}
+
+function sampleChanged(before, after) {
+  if (!before || !after) return false;
+  if (before.className !== after.className) return true;
+  return Object.keys(styleDiff(before.styles || before, after.styles || after)).length > 0;
+}
+
+function createMotionManifest(source) {
+  const motion = source.motion_data || {};
+  const candidates = new Map();
+  for (const candidate of motion.candidates || []) {
+    if (!candidate.element_id) continue;
+    candidates.set(candidate.element_id, {
+      element_id: candidate.element_id,
+      tag: candidate.tag || "",
+      className: candidate.className || "",
+      attrs: candidate.attrs || {},
+      rect: compactRect(candidate.rect),
+      triggers: []
+    });
+  }
+
+  const loadFrames = motion.load_samples || [];
+  if (loadFrames.length >= 2) {
+    const first = sampleMap(loadFrames[0]);
+    const last = sampleMap(loadFrames.at(-1));
+    for (const [id, before] of first) {
+      const after = last.get(id);
+      if (!after || !sampleChanged(before, after)) continue;
+      const item = candidates.get(id) || { element_id: id, triggers: [] };
+      item.triggers.push({
+        type: "load",
+        delay_ms: 120,
+        initial_styles: pickProps(before, MOTION_STYLE_PROPS),
+        final_styles: pickProps(after, MOTION_STYLE_PROPS),
+        initial_class: before.className || "",
+        final_class: after.className || ""
+      });
+      candidates.set(id, item);
+    }
+  }
+
+  const scrollFrames = motion.scroll_samples || [];
+  if (scrollFrames.length >= 2) {
+    const first = sampleMap(scrollFrames[0]);
+    for (const frame of scrollFrames.slice(1)) {
+      const current = sampleMap(frame);
+      for (const [id, before] of first) {
+        const after = current.get(id);
+        if (!after || !sampleChanged(before, after)) continue;
+        const item = candidates.get(id) || { element_id: id, triggers: [] };
+        if (item.triggers.some((trigger) => trigger.type === "scroll")) continue;
+        const triggerY = Number(frame.scrollY || 0);
+        item.triggers.push({
+          type: "scroll",
+          trigger_scroll_y: triggerY,
+          root_margin: triggerY > 0 ? "0px 0px -12% 0px" : "0px",
+          threshold: triggerY > 0 ? 0.08 : 0.01,
+          initial_styles: pickProps(before, MOTION_STYLE_PROPS),
+          final_styles: pickProps(after, MOTION_STYLE_PROPS),
+          initial_class: before.className || "",
+          final_class: after.className || ""
+        });
+        candidates.set(id, item);
+      }
+    }
+  }
+
+  for (const [type, samples] of Object.entries(motion.interaction_samples || {})) {
+    for (const sample of samples || []) {
+      if (!sample?.candidate?.element_id || !sampleChanged(sample.before, sample.after)) continue;
+      const id = sample.candidate.element_id;
+      const item = candidates.get(id) || { element_id: id, triggers: [] };
+      item.triggers.push({
+        type,
+        initial_styles: pickProps(sample.before?.styles || {}, MOTION_STYLE_PROPS),
+        final_styles: pickProps(sample.after?.styles || {}, MOTION_STYLE_PROPS),
+        initial_class: sample.before?.className || "",
+        final_class: sample.after?.className || "",
+        attrs: sample.after?.attrs || {}
+      });
+      candidates.set(id, item);
+    }
+  }
+
+  for (const [id, item] of candidates) {
+    const className = item.className || "";
+    const attrs = item.attrs || {};
+    if (!item.triggers.length && /animate-word|animate-space/i.test(className)) {
+      item.triggers.push({
+        type: "load",
+        delay_ms: 120,
+        initial_styles: { opacity: "0", transform: "translateY(0.7em)" },
+        final_styles: { opacity: "1", transform: "translateY(0)" }
+      });
+    }
+    if (!item.triggers.length && (attrs["data-scroll"] !== undefined || attrs["data-w-id"] !== undefined || /reveal|motion|animate/i.test(className))) {
+      item.triggers.push({
+        type: "scroll",
+        root_margin: "0px 0px -12% 0px",
+        threshold: 0.08,
+        initial_styles: { opacity: "0", transform: "translateY(18px)" },
+        final_styles: { opacity: "1", transform: "translateY(0)" }
+      });
+    }
+    candidates.set(id, item);
+  }
+
+  return {
+    items: Array.from(candidates.values()).filter((item) => item.triggers?.length).slice(0, 120),
+    markers: motion.markers || {}
+  };
+}
+
+function createMotionContract(source, ids = null) {
   const motion = source.motion_data || {};
   const css = source.css_data || {};
   const markers = motion.markers || {};
+  const filterByIds = (items) => (ids ? (items || []).filter((item) => !item.element_id || ids.has(item.element_id)) : items || []);
   return {
-    has_motion: Boolean((motion.candidates || []).length || (css.animations || []).length || Object.values(markers).some(Boolean)),
+    has_motion: Boolean((motion.candidates || []).length || (css.keyframes || []).length || Object.values(markers).some(Boolean)),
     markers: Object.entries(markers).filter(([, value]) => Boolean(value)).map(([key]) => key),
-    candidates: (motion.candidates || []).slice(0, 80),
+    candidates: filterByIds(motion.candidates).slice(0, 80),
     load_samples: motion.load_samples || [],
     scroll_samples: motion.scroll_samples || [],
+    interaction_samples: motion.interaction_samples || {},
     keyframes: css.keyframes || [],
-    transitions: css.transitions || [],
+    transitions: filterByIds(css.transitions).slice(0, 160),
     acceptance: [
       "Preserve source motion markers where practical.",
       "Visible nav/dropdown, hover/focus, word stagger, and scroll reveal behavior must be represented.",
@@ -535,12 +831,16 @@ function analyzeSections(source, maxSections = 12) {
   return selected.slice(0, maxSections).map((item, index) => {
     const namespace = `${item.type}_${index + 1}`;
     const html = $.html(item.element);
+    const elementId = $(item.element).attr("data-web-clone-id") || null;
     return {
       id: namespace,
       order: index,
       type: item.type,
       namespace,
       component_name: pascalCase(namespace, "Section"),
+      element_id: elementId,
+      element_ids: Array.from(idsForSection($, item.element)),
+      viewport: source.viewport || null,
       outer_html: html,
       text: elementText($, item.element).slice(0, 2000),
       images: $("img", item.element).map((_, img) => ({
@@ -555,13 +855,16 @@ function analyzeSections(source, maxSections = 12) {
   });
 }
 
-export async function createContractBundle(source, outDir, maxTokens = 10_000) {
+export async function createContractBundle(source, outDir, maxTokens = 10_000, viewportSources = null) {
   await removeDir(outDir);
   await ensureDir(path.join(outDir, "contracts"));
   await ensureDir(path.join(outDir, "prompts"));
   const sections = analyzeSections(source);
   const assetMap = assetMapFromSource(source);
+  const elementIndex = createElementIndex(source.dom_tree);
+  const sourceViewports = viewportSources && Object.keys(viewportSources).length ? viewportSources : { [source.viewport?.name || "desktop"]: source };
   const favicon = source.favicon || extractFaviconFromHtml(source.raw_html || "", source.url);
+  const motionManifest = createMotionManifest(source);
   const shared = {
     source_url: source.url,
     title: source.metadata?.title || "",
@@ -569,38 +872,72 @@ export async function createContractBundle(source, outDir, maxTokens = 10_000) {
     assets: source.assets || {},
     asset_mirror: source.asset_mirror || {},
     favicon,
+    document_state: source.document_state || {},
     viewport_profiles: source.viewport_profiles || {},
-    motion_contract: createMotionContract(source)
+    motion_contract: createMotionContract(source),
+    motion_manifest: motionManifest,
+    visual_contract: {
+      images: source.image_metrics || [],
+      backgrounds: source.background_metrics || [],
+      pseudo_elements: source.pseudo_elements || [],
+      components: source.components || []
+    }
   };
   await writeJson(path.join(outDir, "shared.json"), shared);
 
   const contracts = [];
   for (const section of sections) {
     const componentName = section.component_name;
+    const ids = new Set(section.element_ids || []);
+    const layoutContract = createLayoutContract(section, ids, elementIndex);
+    const imageContract = createImageContract(source, ids);
+    const backgroundContract = createBackgroundContract(source, ids);
+    const pseudoContract = createPseudoContract(source, ids);
+    const viewportContracts = {};
+    for (const [viewportName, viewportSource] of Object.entries(sourceViewports)) {
+      const viewportSection = { ...section, viewport: viewportSource.viewport || section.viewport };
+      const viewportIndex = createElementIndex(viewportSource.dom_tree);
+      viewportContracts[viewportName] = {
+        viewport: viewportSource.viewport || null,
+        layout_contract: createLayoutContract(viewportSection, ids, viewportIndex),
+        image_contract: createImageContract(viewportSource, ids),
+        background_contract: createBackgroundContract(viewportSource, ids),
+        pseudo_contract: createPseudoContract(viewportSource, ids)
+      };
+    }
     const contract = {
       id: section.id,
       order: section.order,
       type: section.type,
       namespace: section.namespace,
       component_name: componentName,
+      element_id: section.element_id,
       source: {
         raw_html: rewriteUrlsWithAssetMap(normalizeHtmlUrls(section.outer_html, source.url), assetMap, source.url),
         text: section.text,
         images: section.images,
         links: section.links,
-        motion_contract: shared.motion_contract
+        motion_contract: createMotionContract(source, ids)
       },
+      layout_contract: layoutContract,
+      image_contract: imageContract,
+      background_contract: backgroundContract,
+      pseudo_contract: pseudoContract,
+      viewport_contracts: viewportContracts,
+      motion_contract: createMotionContract(source, ids),
       constraints: {
         max_tokens: maxTokens,
         preserve_wrapper: true,
         no_dangerously_set_inner_html: true,
-        local_assets_default: true
+        local_assets_default: true,
+        preserve_data_web_clone_id: true
       },
       acceptance_criteria: [
         "Preserve the source root wrapper, class names, asset URLs, links, and text.",
         "Render explicit JSX with no dangerouslySetInnerHTML.",
         "Keep header/nav/footer wrappers intact.",
-        "Preserve motion markers and interaction state where visible."
+        "Preserve motion markers and interaction state where visible.",
+        "Respect layout, image, background, pseudo-element, and motion contracts unless visual verification shows a better correction."
       ],
       deliverables: [
         {
@@ -610,8 +947,10 @@ export async function createContractBundle(source, outDir, maxTokens = 10_000) {
         {
           path: `src/components/sections/${section.namespace}/${section.namespace}.css`
         }
-      ]
+      ],
+      fidelity_css: ""
     };
+    contract.fidelity_css = generateSectionFidelityCss(contract, assetMap, source.url);
     contracts.push(contract);
     await writeJson(path.join(outDir, "contracts", `${section.namespace}.json`), contract);
     await writeText(
@@ -639,6 +978,124 @@ export async function createContractBundle(source, outDir, maxTokens = 10_000) {
     sections: sections.map(({ outer_html, ...rest }) => rest)
   });
   return { contracts, integration, shared };
+}
+
+function cssEscapeString(value) {
+  return String(value || "").replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+function cssPropName(prop) {
+  return String(prop).replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`);
+}
+
+function cssDecls(styles = {}, assetMap = {}, baseUrl = "", options = {}) {
+  const lines = [];
+  for (const [prop, rawValue] of Object.entries(styles || {})) {
+    if (rawValue === undefined || rawValue === null || rawValue === "") continue;
+    if (!options.allowContent && prop === "content") continue;
+    let value = String(rawValue);
+    if (value === "normal" || value === "none 0s ease 0s") continue;
+    if (/^(width|height|min-width|max-width|min-height|max-height)$/i.test(cssPropName(prop)) && value === "auto") continue;
+    value = rewriteUrlsWithAssetMap(value, assetMap, baseUrl);
+    lines.push(`  ${cssPropName(prop)}: ${value};`);
+  }
+  return lines;
+}
+
+function selectorForCloneId(id) {
+  return `:where([data-web-clone-id="${cssEscapeString(id)}"])`;
+}
+
+function generateSectionFidelityCss(contract, assetMap = {}, baseUrl = "") {
+  const renderObservedCss = (observed) => {
+    const blocks = [];
+    const addBlock = (selector, styles, options = {}) => {
+      if (!selector || selector.includes('""')) return;
+      const decls = cssDecls(styles, assetMap, baseUrl, options);
+      if (!decls.length) return;
+      blocks.push(`${selector} {\n${decls.join("\n")}\n}`);
+    };
+
+    for (const item of observed.layout_contract?.important_elements || []) {
+      const props = { ...(item.styles || {}) };
+      if (!["fixed", "sticky"].includes(props.position)) {
+        delete props.top;
+        delete props.right;
+        delete props.bottom;
+        delete props.left;
+        delete props.zIndex;
+      }
+      if (!["img", "video", "canvas", "svg"].includes(item.tag)) {
+        delete props.width;
+        delete props.height;
+        delete props.maxHeight;
+        delete props.aspectRatio;
+        delete props.objectFit;
+        delete props.objectPosition;
+      }
+      addBlock(selectorForCloneId(item.element_id), props);
+    }
+
+    for (const image of observed.image_contract?.images || []) {
+      addBlock(selectorForCloneId(image.element_id), {
+        ...(image.styles || {}),
+        aspectRatio: image.rendered_aspect_ratio ? `${Number(image.rendered_aspect_ratio).toFixed(5)} / 1` : image.styles?.aspectRatio
+      });
+    }
+
+    for (const background of observed.background_contract?.backgrounds || []) {
+      const styles = {
+        backgroundColor: background.backgroundColor,
+        backgroundImage: background.backgroundImage,
+        backgroundSize: background.backgroundSize,
+        backgroundPosition: background.backgroundPosition,
+        backgroundRepeat: background.backgroundRepeat,
+        backgroundAttachment: background.backgroundAttachment
+      };
+      addBlock(selectorForCloneId(background.element_id), styles);
+    }
+
+    for (const pseudo of observed.pseudo_contract?.pseudo_elements || []) {
+      const styles = { ...(pseudo.styles || {}) };
+      if (styles.content && !/^["'].*["']$/.test(styles.content) && styles.content !== "none") {
+        styles.content = JSON.stringify(styles.content);
+      }
+      addBlock(`${selectorForCloneId(pseudo.element_id)}${pseudo.pseudo}`, styles, { allowContent: true });
+    }
+    return blocks;
+  };
+
+  const blocks = renderObservedCss(contract);
+  const viewportEntries = Object.entries(contract.viewport_contracts || {})
+    .filter(([, observed]) => observed?.viewport?.width)
+    .sort(([, left], [, right]) => Number(right.viewport.width) - Number(left.viewport.width));
+  for (const [name, observed] of viewportEntries) {
+    if (name === "desktop") continue;
+    const viewportBlocks = renderObservedCss(observed);
+    if (!viewportBlocks.length) continue;
+    blocks.push(`@media (max-width: ${Number(observed.viewport.width)}px) {\n${viewportBlocks.map((block) => indentCssBlock(block)).join("\n\n")}\n}`);
+  }
+
+  if (!blocks.length) return `/* No observed fidelity corrections for ${contract.component_name}. */\n`;
+  return `/* Generated from browser-observed layout, media, background, and pseudo-element contracts. */\n${blocks.join("\n\n")}\n`;
+}
+
+function indentCssBlock(block) {
+  return String(block)
+    .split("\n")
+    .map((line) => (line ? `  ${line}` : line))
+    .join("\n");
+}
+
+export function generateFidelityCss(shared, contracts) {
+  const documentStyles = [];
+  const htmlStyles = pickProps(shared.document_state?.html?.styles || {}, ["backgroundColor", "backgroundImage", "backgroundSize", "backgroundPosition", "backgroundRepeat", "color"]);
+  const bodyStyles = pickProps(shared.document_state?.body?.styles || {}, ["backgroundColor", "backgroundImage", "backgroundSize", "backgroundPosition", "backgroundRepeat", "color", "fontFamily", "fontSize", "fontWeight", "lineHeight"]);
+  const assetMap = shared.asset_mirror?.by_url || {};
+  if (Object.keys(htmlStyles).length) documentStyles.push(`html {\n${cssDecls(htmlStyles, assetMap, shared.source_url).join("\n")}\n}`);
+  if (Object.keys(bodyStyles).length) documentStyles.push(`body {\n${cssDecls(bodyStyles, assetMap, shared.source_url).join("\n")}\n}`);
+  const sectionCss = (contracts || []).map((contract) => contract.fidelity_css || "").filter(Boolean).join("\n");
+  return `${documentStyles.join("\n\n")}\n\n${sectionCss}`.trimEnd() + "\n";
 }
 
 function escapeJsString(value) {
@@ -743,12 +1200,148 @@ export function htmlToJsx(html, assetMap = {}, baseUrl = "") {
 }
 
 export function generateRuntimeSource() {
-  return `export function initCloneRuntime() {
+  return `export function initCloneRuntime(motionManifest = {}) {
   injectCloneMotionStyles();
-  initWordStagger();
-  initScrollReveal();
-  initGenericInteractions();
+  initManifestMotion(motionManifest);
+  initWebflowDropdowns();
+  initWebflowNav();
+  initGenericToggles();
+  if (!motionManifest?.items?.length) initFallbackMotion();
+  document.documentElement.dataset.cloneMotionRuntime = 'ready';
+}
 
+function byCloneId(id) {
+  if (!id || !window.CSS?.escape) return null;
+  return document.querySelector(\`[data-web-clone-id="\${CSS.escape(id)}"]\`);
+}
+
+function setStyles(element, styles = {}) {
+  for (const [key, value] of Object.entries(styles || {})) {
+    if (value === undefined || value === null || value === '') continue;
+    element.style[key] = String(value);
+  }
+}
+
+function setClassSnapshot(element, className) {
+  if (typeof className !== 'string' || !className.trim()) return;
+  const preserved = Array.from(element.classList).filter((name) => name.startsWith('clone-'));
+  element.className = className;
+  preserved.forEach((name) => element.classList.add(name));
+}
+
+function injectCloneMotionStyles() {
+  if (document.getElementById('clone-motion-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'clone-motion-styles';
+  style.textContent = \`
+    @media (prefers-reduced-motion: no-preference) {
+      [data-web-clone-motion] {
+        transition-property: opacity, transform, filter, clip-path, color, background-color, border-color, box-shadow;
+        transition-duration: var(--clone-motion-duration, 650ms);
+        transition-timing-function: cubic-bezier(.16,1,.3,1);
+      }
+      .clone-motion-hoverable {
+        transition-property: color, background-color, border-color, box-shadow, opacity, transform;
+        transition-duration: 180ms;
+        transition-timing-function: ease;
+      }
+      .clone-state-open {
+        opacity: 1;
+        visibility: visible;
+      }
+    }
+  \`;
+  document.head.appendChild(style);
+}
+
+function initManifestMotion(manifest) {
+  const items = Array.isArray(manifest?.items) ? manifest.items : [];
+  items.forEach((item, index) => {
+    const element = byCloneId(item.element_id);
+    if (!element || element.dataset.cloneManifestBound) return;
+    element.dataset.cloneManifestBound = 'true';
+    element.dataset.webCloneMotion = 'true';
+    element.setAttribute('data-web-clone-motion', 'true');
+
+    (item.triggers || []).forEach((trigger) => {
+      if (trigger.initial_styles) setStyles(element, trigger.initial_styles);
+      if (trigger.initial_class) setClassSnapshot(element, trigger.initial_class);
+
+      if (trigger.type === 'load') {
+        window.setTimeout(() => {
+          if (trigger.final_class) setClassSnapshot(element, trigger.final_class);
+          setStyles(element, trigger.final_styles || {});
+          element.dataset.cloneMotionState = 'load-final';
+        }, Number(trigger.delay_ms || 120) + Math.min(index * 35, 420));
+      } else if (trigger.type === 'scroll') {
+        bindScrollTrigger(element, trigger);
+      } else if (trigger.type === 'hover') {
+        element.classList.add('clone-motion-hoverable');
+        element.addEventListener('mouseenter', () => {
+          if (trigger.final_class) setClassSnapshot(element, trigger.final_class);
+          setStyles(element, trigger.final_styles || {});
+          element.dataset.cloneMotionState = 'hover-final';
+        });
+        element.addEventListener('mouseleave', () => {
+          if (trigger.initial_class) setClassSnapshot(element, trigger.initial_class);
+          setStyles(element, trigger.initial_styles || {});
+          element.dataset.cloneMotionState = 'hover-initial';
+        });
+      } else if (trigger.type === 'focus') {
+        element.addEventListener('focus', () => {
+          if (trigger.final_class) setClassSnapshot(element, trigger.final_class);
+          setStyles(element, trigger.final_styles || {});
+          element.dataset.cloneMotionState = 'focus-final';
+        });
+        element.addEventListener('blur', () => {
+          if (trigger.initial_class) setClassSnapshot(element, trigger.initial_class);
+          setStyles(element, trigger.initial_styles || {});
+          element.dataset.cloneMotionState = 'focus-initial';
+        });
+      } else if (trigger.type === 'click') {
+        element.addEventListener('click', (event) => {
+          if (element.matches('a[href]')) event.preventDefault();
+          const open = element.dataset.cloneClickOpen !== 'true';
+          element.dataset.cloneClickOpen = String(open);
+          if (open) {
+            if (trigger.final_class) setClassSnapshot(element, trigger.final_class);
+            setStyles(element, trigger.final_styles || {});
+            element.dataset.cloneMotionState = 'click-final';
+          } else {
+            if (trigger.initial_class) setClassSnapshot(element, trigger.initial_class);
+            setStyles(element, trigger.initial_styles || {});
+            element.dataset.cloneMotionState = 'click-initial';
+          }
+        });
+      }
+    });
+  });
+}
+
+function bindScrollTrigger(element, trigger) {
+  const reveal = () => {
+    if (trigger.final_class) setClassSnapshot(element, trigger.final_class);
+    setStyles(element, trigger.final_styles || {});
+    element.dataset.cloneMotionState = 'scroll-final';
+  };
+  if (!('IntersectionObserver' in window)) {
+    reveal();
+    return;
+  }
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      if (!entry.isIntersecting) return;
+      reveal();
+      observer.unobserve(entry.target);
+    });
+  }, {
+    threshold: Number(trigger.threshold ?? 0.08),
+    rootMargin: trigger.root_margin || '0px 0px -12% 0px'
+  });
+  observer.observe(element);
+}
+
+function initWebflowDropdowns() {
   Array.from(document.querySelectorAll('.w-dropdown')).forEach((dropdown) => {
     if (dropdown.dataset.cloneDropdownBound) return;
     const toggle = dropdown.querySelector('.w-dropdown-toggle');
@@ -775,7 +1368,9 @@ export function generateRuntimeSource() {
       else open();
     });
   });
+}
 
+function initWebflowNav() {
   Array.from(document.querySelectorAll('.w-nav-button')).forEach((button) => {
     if (button.dataset.cloneNavBound) return;
     button.dataset.cloneNavBound = 'true';
@@ -792,96 +1387,10 @@ export function generateRuntimeSource() {
       button.setAttribute('aria-expanded', String(isOpen));
     });
   });
-
-  document.documentElement.dataset.cloneMotionRuntime = 'ready';
 }
 
-function injectCloneMotionStyles() {
-  if (document.getElementById('clone-motion-styles')) return;
-  const style = document.createElement('style');
-  style.id = 'clone-motion-styles';
-  style.textContent = \`
-    @media (prefers-reduced-motion: no-preference) {
-      .clone-motion-word {
-        opacity: 0;
-        transform: translateY(0.7em);
-        transition: opacity 520ms cubic-bezier(.16,1,.3,1), transform 520ms cubic-bezier(.16,1,.3,1);
-      }
-      .clone-motion-word.clone-motion-visible {
-        opacity: 1;
-        transform: translateY(0);
-      }
-      .clone-motion-reveal {
-        opacity: 0;
-        transform: translateY(18px);
-        transition: opacity 650ms cubic-bezier(.16,1,.3,1), transform 650ms cubic-bezier(.16,1,.3,1);
-      }
-      .clone-motion-reveal.clone-motion-visible {
-        opacity: 1;
-        transform: translateY(0);
-      }
-      .clone-motion-hoverable {
-        transition-property: color, background-color, border-color, box-shadow, opacity, transform;
-        transition-duration: 180ms;
-        transition-timing-function: ease;
-      }
-      .clone-motion-hoverable:hover {
-        transform: translateY(-1px);
-      }
-    }
-  \`;
-  document.head.appendChild(style);
-}
-
-function initWordStagger() {
-  Array.from(document.querySelectorAll('.animate-word')).forEach((word, index) => {
-    if (word.dataset.cloneMotionBound) return;
-    word.dataset.cloneMotionBound = 'word';
-    word.classList.add('clone-motion-word');
-    word.style.opacity = '0';
-    word.style.transform = 'translateY(0.7em)';
-    window.setTimeout(() => {
-      word.classList.add('clone-motion-visible');
-      word.style.opacity = '';
-      word.style.transform = '';
-    }, 120 + Math.min(index * 55, 650));
-  });
-}
-
-function initScrollReveal() {
-  const selector = ['[data-scroll]', '.article-card', '.article-list-item', '.btn_main_wrap', '[class*="cta"] img'].join(',');
-  const candidates = Array.from(document.querySelectorAll(selector))
-    .filter((element) => element instanceof HTMLElement && element.getBoundingClientRect().height > 0);
-  if (!candidates.length) return;
-  const reveal = (element) => {
-    element.classList.add('clone-motion-visible');
-    element.dataset.cloneMotionVisible = 'true';
-  };
-  if (!('IntersectionObserver' in window)) {
-    candidates.forEach(reveal);
-    return;
-  }
-  const observer = new IntersectionObserver((entries) => {
-    entries.forEach((entry) => {
-      if (!entry.isIntersecting) return;
-      reveal(entry.target);
-      observer.unobserve(entry.target);
-    });
-  }, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' });
-  candidates.forEach((element, index) => {
-    if (element.dataset.cloneMotionBound) return;
-    element.dataset.cloneMotionBound = 'reveal';
-    element.classList.add('clone-motion-reveal');
-    element.style.transitionDelay = element.style.transitionDelay || \`\${Math.min(index * 35, 260)}ms\`;
-    observer.observe(element);
-  });
-}
-
-function initGenericInteractions() {
-  Array.from(document.querySelectorAll('a, button, [role="button"], .btn_main_wrap, .button, [class*="button"], [class*="btn"]')).forEach((element) => {
-    element.classList.add('clone-motion-hoverable');
-  });
-  Array.from(document.querySelectorAll('[data-toggle], [aria-controls], .accordion, .tabs, [class*="accordion"], [class*="tab"]')).forEach((toggle) => {
+function initGenericToggles() {
+  Array.from(document.querySelectorAll('[data-toggle], [aria-controls], .accordion, .tabs, [class*="accordion"], [class*="tab"], [class*="modal"], [class*="carousel"]')).forEach((toggle) => {
     if (toggle.dataset.cloneToggleBound) return;
     toggle.dataset.cloneToggleBound = 'true';
     toggle.addEventListener('click', () => {
@@ -889,6 +1398,48 @@ function initGenericInteractions() {
       const controls = toggle.getAttribute('aria-controls');
       if (controls) document.getElementById(controls)?.classList.toggle('clone-state-open');
     });
+  });
+}
+
+function initFallbackMotion() {
+  Array.from(document.querySelectorAll('.animate-word')).forEach((word, index) => {
+    if (word.dataset.cloneFallbackBound) return;
+    word.dataset.cloneFallbackBound = 'word';
+    word.setAttribute('data-web-clone-motion', 'true');
+    word.style.opacity = '0';
+    word.style.transform = 'translateY(0.7em)';
+    window.setTimeout(() => {
+      word.style.opacity = '1';
+      word.style.transform = 'translateY(0)';
+      word.dataset.cloneMotionState = 'fallback-word-final';
+    }, 120 + Math.min(index * 55, 650));
+  });
+
+  const candidates = Array.from(document.querySelectorAll('[data-scroll], .article-card, .article-list-item, .btn_main_wrap, [class*="cta"] img'))
+    .filter((element) => element instanceof HTMLElement && element.getBoundingClientRect().height > 0);
+  const observer = 'IntersectionObserver' in window
+    ? new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          entry.target.style.opacity = '1';
+          entry.target.style.transform = 'translateY(0)';
+          entry.target.dataset.cloneMotionState = 'fallback-scroll-final';
+          observer.unobserve(entry.target);
+        });
+      }, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' })
+    : null;
+  candidates.forEach((element, index) => {
+    if (element.dataset.cloneFallbackBound) return;
+    element.dataset.cloneFallbackBound = 'reveal';
+    element.setAttribute('data-web-clone-motion', 'true');
+    element.style.opacity = '0';
+    element.style.transform = 'translateY(18px)';
+    element.style.transitionDelay = element.style.transitionDelay || \`\${Math.min(index * 35, 260)}ms\`;
+    if (observer) observer.observe(element);
+    else {
+      element.style.opacity = '1';
+      element.style.transform = 'translateY(0)';
+    }
   });
 }
 `;

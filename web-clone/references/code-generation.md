@@ -8,6 +8,7 @@ Use this reference after `contracts/shared.json`, `contracts/integration_plan.js
 - Keep work inside `src/components/sections/<namespace>/`.
 - Preserve source root wrappers. Header, nav, hero, and footer must not be split into loose text or list fragments.
 - Preserve text, images, links, class names, semantic order, CTA/button styling, and local `/assets/...` URLs.
+- Preserve `data-web-clone-id` attributes. They connect JSX, fidelity CSS, motion manifests, and verification reports.
 - Preserve `data-scroll`, `animate-*`, `w-dropdown`, `w-nav-button`, `w-nav-menu`, `data-w-id`, and related interaction markers unless replacing them with explicit equivalent behavior.
 - Use explicit JSX. Do not use `dangerouslySetInnerHTML`.
 
@@ -15,9 +16,10 @@ Use this reference after `contracts/shared.json`, `contracts/integration_plan.js
 
 - Convert `class` to `className`, `for` to `htmlFor`, and inline style strings to React style objects.
 - Keep source classes when `src/styles/original.css` contains useful rules.
+- Use `layout_contract`, `image_contract`, `background_contract`, and `pseudo_contract` before inventing CSS. These contracts contain observed rects, computed styles, rendered image ratios, background settings, and pseudo-element content.
 - Rewrite image, `srcSet`, CSS `url(...)`, favicon, manifest, and font URLs to local `/assets/...` when available.
 - Remove scripts and inline event handlers; recreate visible behavior with React state or `src/runtime/cloneRuntime.js`.
-- Do not add motion libraries. Practical motion is vanilla JS/CSS via the runtime plus section CSS where needed.
+- Do not add motion libraries. Practical motion is vanilla JS/CSS via `src/runtime/cloneRuntime.js` and `src/runtime/motionManifest.js`.
 
 ## Fidelity Checklist
 
@@ -26,6 +28,7 @@ Use this reference after `contracts/shared.json`, `contracts/integration_plan.js
 - Hero headline, CTA/button styling, and primary visual are visible.
 - Footer renders as grouped grid/list columns, not a left-edge text dump.
 - Animations, hover states, focus states, dropdown states, word stagger, and scroll reveal are reproduced or visibly equivalent when source motion candidates exist.
+- Image aspect ratios, `object-fit`, `object-position`, major background colors/images, and pseudo-elements match the observed contract unless manual inspection proves the contract is misleading.
 - Desktop, tablet, and mobile have no incoherent overlap or horizontal overflow.
 - Mobile nav is usable: tapping the visible nav button must change open state or reveal menu content.
 - Local favicon/icon links exist in `index.html`.
@@ -40,8 +43,8 @@ Run build, launch a local preview, then run `verify-clone.mjs --run-dir RUN_DIR 
 - missing header/nav/hero/footer/button/image checks
 - horizontal overflow or unusable mobile nav
 - source motion exists but no runtime/class/style change is detected
+- image layout, important background, or header/nav/hero/footer region checks fail
 - desktop first/full mismatch above `12%` / `18%`
 - tablet first/full mismatch above `16%` / `22%`
 - mobile first/full mismatch above `18%` / `24%`
 - any generated component containing `dangerouslySetInnerHTML`
-

@@ -30,6 +30,36 @@ async function lazyLoad(page, waitMs) {
   await page.waitForTimeout(350);
 }
 
+async function assignStableIds(page) {
+  await page.evaluate(() => {
+    function stablePath(element) {
+      if (!element || element.nodeType !== Node.ELEMENT_NODE) return "node";
+      if (element === document.documentElement) return "html";
+      if (element === document.body) return "body";
+      const parts = [];
+      let current = element;
+      while (current && current.nodeType === Node.ELEMENT_NODE && current !== document.documentElement) {
+        const tag = current.tagName.toLowerCase();
+        let index = 1;
+        let sibling = current.previousElementSibling;
+        while (sibling) {
+          if (sibling.tagName === current.tagName) index += 1;
+          sibling = sibling.previousElementSibling;
+        }
+        parts.unshift(`${tag}${index}`);
+        current = current.parentElement;
+      }
+      return parts.join("-");
+    }
+
+    Array.from(document.querySelectorAll("*")).forEach((element) => {
+      if (!element.getAttribute("data-web-clone-id")) {
+        element.setAttribute("data-web-clone-id", `wc-${stablePath(element)}`);
+      }
+    });
+  });
+}
+
 async function motionSnapshot(page, label) {
   return page.evaluate((snapshotLabel) => {
     const candidates = Array.from(
@@ -45,6 +75,7 @@ async function motionSnapshot(page, label) {
         const rect = element.getBoundingClientRect();
         return {
           index,
+          element_id: element.getAttribute("data-web-clone-id") || "",
           tag: element.tagName.toLowerCase(),
           className: typeof element.className === "string" ? element.className : "",
           id: element.id || "",
@@ -62,10 +93,103 @@ async function motionSnapshot(page, label) {
   }, label);
 }
 
+async function collectInteractionSamples(page) {
+  await page.evaluate(() => {
+    if (window.__webClonePreventNavigation) return;
+    window.__webClonePreventNavigation = true;
+    document.addEventListener(
+      "click",
+      (event) => {
+        if (event.target?.closest?.("a[href], form")) event.preventDefault();
+      },
+      true
+    );
+  });
+  const candidates = await page.evaluate(() =>
+    Array.from(
+      document.querySelectorAll(
+        "a,button,[role='button'],[tabindex],.w-dropdown-toggle,.w-nav-button,[aria-controls],[data-toggle],[class*='button'],[class*='btn'],[class*='dropdown'],[class*='accordion'],[class*='tab']"
+      )
+    )
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        return {
+          element_id: element.getAttribute("data-web-clone-id") || "",
+          tag: element.tagName.toLowerCase(),
+          className: typeof element.className === "string" ? element.className : "",
+          id: element.id || "",
+          text: (element.textContent || "").trim().replace(/\s+/g, " ").slice(0, 80),
+          focusable: typeof element.focus === "function",
+          rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+        };
+      })
+      .filter((item) => item.element_id && item.rect.width > 0 && item.rect.height > 0)
+      .slice(0, 24)
+  );
+
+  const sampleFor = async (elementId, label) =>
+    page.evaluate(
+      ({ id, sampleLabel }) => {
+        const element = document.querySelector(`[data-web-clone-id="${CSS.escape(id)}"]`);
+        if (!element) return null;
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return {
+          label: sampleLabel,
+          element_id: id,
+          className: typeof element.className === "string" ? element.className : "",
+          attrs: Object.fromEntries(Array.from(element.attributes || []).map((attr) => [attr.name, attr.value])),
+          styles: {
+            opacity: style.opacity,
+            transform: style.transform,
+            transition: style.transition,
+            animation: style.animation,
+            color: style.color,
+            backgroundColor: style.backgroundColor,
+            borderColor: style.borderColor,
+            boxShadow: style.boxShadow,
+            filter: style.filter,
+            visibility: style.visibility,
+            display: style.display
+          },
+          rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+        };
+      },
+      { id: elementId, sampleLabel: label }
+    );
+
+  const samples = { hover: [], focus: [], click: [] };
+  for (const candidate of candidates) {
+    const before = await sampleFor(candidate.element_id, "before");
+    const centerX = candidate.rect.x + candidate.rect.width / 2;
+    const centerY = candidate.rect.y + candidate.rect.height / 2;
+
+    await page.mouse.move(centerX, centerY);
+    await page.waitForTimeout(90);
+    samples.hover.push({ candidate, before, after: await sampleFor(candidate.element_id, "hover") });
+
+    if (candidate.focusable) {
+      await page.evaluate((id) => document.querySelector(`[data-web-clone-id="${CSS.escape(id)}"]`)?.focus?.(), candidate.element_id);
+      await page.waitForTimeout(80);
+      samples.focus.push({ candidate, before, after: await sampleFor(candidate.element_id, "focus") });
+      await page.evaluate(() => document.activeElement?.blur?.());
+    }
+
+    await page.mouse.click(centerX, centerY);
+    await page.waitForTimeout(120);
+    samples.click.push({ candidate, before, after: await sampleFor(candidate.element_id, "click") });
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.mouse.move(0, 0);
+    await page.waitForTimeout(50);
+  }
+  return samples;
+}
+
 async function extractPage(browser, url, viewportName, viewport, options) {
   const [width, height] = viewport;
   const page = await browser.newPage({ viewport: { width, height } });
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  await assignStableIds(page);
   await lazyLoad(page, options.wait);
 
   const loadSamples = [];
@@ -100,6 +224,8 @@ async function extractPage(browser, url, viewportName, viewport, options) {
         "width",
         "height",
         "maxWidth",
+        "minWidth",
+        "maxHeight",
         "minHeight",
         "margin",
         "padding",
@@ -112,19 +238,43 @@ async function extractPage(browser, url, viewportName, viewport, options) {
         "background",
         "backgroundColor",
         "backgroundImage",
+        "backgroundSize",
+        "backgroundPosition",
+        "backgroundRepeat",
+        "backgroundAttachment",
         "border",
+        "borderColor",
+        "borderWidth",
+        "borderStyle",
         "borderRadius",
         "boxShadow",
         "opacity",
         "transform",
+        "transformOrigin",
         "transition",
         "animation",
+        "visibility",
         "overflow",
+        "overflowX",
+        "overflowY",
+        "objectFit",
+        "objectPosition",
         "flexDirection",
+        "flexWrap",
         "justifyContent",
         "alignItems",
+        "alignContent",
+        "gridTemplateRows",
         "gridTemplateColumns",
-        "gap"
+        "gap",
+        "rowGap",
+        "columnGap",
+        "textAlign",
+        "textTransform",
+        "whiteSpace",
+        "filter",
+        "clipPath",
+        "aspectRatio"
       ];
 
       function stylesFor(element) {
@@ -148,9 +298,25 @@ async function extractPage(browser, url, viewportName, viewport, options) {
         };
       }
 
+      function pseudoFor(element, pseudo) {
+        const style = getComputedStyle(element, pseudo);
+        const content = style.content || "";
+        if (!content || content === "none" || content === "normal") return null;
+        const output = { content };
+        for (const key of importantStyles) output[key] = style[key] || style.getPropertyValue(key);
+        return output;
+      }
+
+      function backgroundUrls(value) {
+        const urls = [];
+        for (const match of String(value || "").matchAll(/url\(["']?([^"')]+)["']?\)/gi)) urls.push(match[1]);
+        return urls;
+      }
+
       function walk(element, depth = 0) {
         if (!element || depth > maxDepth || element.nodeType !== Node.ELEMENT_NODE) return null;
         return {
+          element_id: element.getAttribute("data-web-clone-id") || "",
           tag: element.tagName.toLowerCase(),
           id: element.id || "",
           className: typeof element.className === "string" ? element.className : "",
@@ -163,11 +329,15 @@ async function extractPage(browser, url, viewportName, viewport, options) {
       }
 
       const assets = { images: [], scripts: [], stylesheets: [], fonts: [], links: [] };
+      const imageMetrics = [];
+      const backgroundMetrics = [];
+      const pseudoElements = [];
       const pushImage = (url, extra = {}) => {
         if (!url) return;
         assets.images.push({
           url,
           src: url,
+          element_id: extra.element_id || "",
           alt: extra.alt || "",
           width: extra.width || null,
           height: extra.height || null,
@@ -176,7 +346,11 @@ async function extractPage(browser, url, viewportName, viewport, options) {
         });
       };
       document.querySelectorAll("img").forEach((img) => {
+        const style = getComputedStyle(img);
+        const rect = rectFor(img);
+        const elementId = img.getAttribute("data-web-clone-id") || "";
         pushImage(img.currentSrc || img.src, {
+          element_id: elementId,
           alt: img.alt || "",
           width: img.naturalWidth || null,
           height: img.naturalHeight || null,
@@ -184,7 +358,29 @@ async function extractPage(browser, url, viewportName, viewport, options) {
           srcset: img.getAttribute("srcset") || img.srcset || ""
         });
         (img.getAttribute("srcset") || "").split(",").forEach((item) => pushImage(item.trim().split(/\s+/)[0], { type: "image-srcset" }));
-        pushImage(img.getAttribute("data-src"), { alt: img.alt || "", type: "data-src" });
+        pushImage(img.getAttribute("data-src"), { element_id: elementId, alt: img.alt || "", type: "data-src" });
+        imageMetrics.push({
+          element_id: elementId,
+          src: img.src || "",
+          currentSrc: img.currentSrc || img.src || "",
+          srcset: img.getAttribute("srcset") || "",
+          alt: img.alt || "",
+          natural_width: img.naturalWidth || null,
+          natural_height: img.naturalHeight || null,
+          rendered_rect: rect,
+          rendered_aspect_ratio: rect.width && rect.height ? rect.width / rect.height : null,
+          natural_aspect_ratio: img.naturalWidth && img.naturalHeight ? img.naturalWidth / img.naturalHeight : null,
+          styles: {
+            objectFit: style.objectFit,
+            objectPosition: style.objectPosition,
+            aspectRatio: style.aspectRatio,
+            display: style.display,
+            width: style.width,
+            height: style.height,
+            maxWidth: style.maxWidth,
+            maxHeight: style.maxHeight
+          }
+        });
       });
       document.querySelectorAll("source[srcset]").forEach((source) => {
         (source.getAttribute("srcset") || "").split(",").forEach((item) => pushImage(item.trim().split(/\s+/)[0], { type: "source-srcset" }));
@@ -195,8 +391,29 @@ async function extractPage(browser, url, viewportName, viewport, options) {
       });
       document.querySelectorAll("*").forEach((element) => {
         const bg = getComputedStyle(element).backgroundImage;
-        const match = bg && bg !== "none" ? bg.match(/url\(["']?([^"')]+)["']?\)/) : null;
-        if (match?.[1]) pushImage(match[1], { type: "background-image" });
+        const style = getComputedStyle(element);
+        const urls = bg && bg !== "none" ? backgroundUrls(bg) : [];
+        urls.forEach((backgroundUrl) => pushImage(backgroundUrl, { element_id: element.getAttribute("data-web-clone-id") || "", type: "background-image" }));
+        if (urls.length || (style.backgroundColor && style.backgroundColor !== "rgba(0, 0, 0, 0)")) {
+          backgroundMetrics.push({
+            element_id: element.getAttribute("data-web-clone-id") || "",
+            tag: element.tagName.toLowerCase(),
+            id: element.id || "",
+            className: typeof element.className === "string" ? element.className : "",
+            urls,
+            backgroundImage: bg,
+            backgroundColor: style.backgroundColor,
+            backgroundSize: style.backgroundSize,
+            backgroundPosition: style.backgroundPosition,
+            backgroundRepeat: style.backgroundRepeat,
+            backgroundAttachment: style.backgroundAttachment,
+            rect: rectFor(element)
+          });
+        }
+        const before = pseudoFor(element, "::before");
+        if (before) pseudoElements.push({ element_id: element.getAttribute("data-web-clone-id") || "", pseudo: "::before", styles: before, rect: rectFor(element) });
+        const after = pseudoFor(element, "::after");
+        if (after) pseudoElements.push({ element_id: element.getAttribute("data-web-clone-id") || "", pseudo: "::after", styles: after, rect: rectFor(element) });
       });
       document.querySelectorAll("script[src]").forEach((script) => assets.scripts.push({ url: script.src, type: "script" }));
       document.querySelectorAll('link[rel="stylesheet"]').forEach((link) => assets.stylesheets.push({ url: link.href, type: "stylesheet" }));
@@ -233,6 +450,7 @@ async function extractPage(browser, url, viewportName, viewport, options) {
         const style = getComputedStyle(element);
         if ((style.transition && style.transition !== "all 0s ease 0s") || (style.animation && style.animation !== "none 0s ease 0s 1 normal none running")) {
           cssData.transitions.push({
+            element_id: element.getAttribute("data-web-clone-id") || "",
             tag: element.tagName.toLowerCase(),
             className: typeof element.className === "string" ? element.className : "",
             transition: style.transition,
@@ -264,12 +482,17 @@ async function extractPage(browser, url, viewportName, viewport, options) {
 
       const components = Array.from(document.querySelectorAll("header,nav,main,section,article,aside,footer,[class*='nav'],[class*='footer'],[class*='hero'],[class*='cta']")).slice(0, 160).map((element, index) => ({
         index,
+        element_id: element.getAttribute("data-web-clone-id") || "",
         tag: element.tagName.toLowerCase(),
         className: typeof element.className === "string" ? element.className : "",
         id: element.id || "",
         text: (element.textContent || "").trim().replace(/\s+/g, " ").slice(0, 220),
-        rect: rectFor(element)
+        rect: rectFor(element),
+        styles: stylesFor(element)
       }));
+
+      const htmlStyles = stylesFor(document.documentElement);
+      const bodyStyles = document.body ? stylesFor(document.body) : {};
 
       return {
         metadata: {
@@ -280,8 +503,26 @@ async function extractPage(browser, url, viewportName, viewport, options) {
         },
         dom_tree: walk(document.body || document.documentElement),
         raw_html: document.documentElement.outerHTML,
+        document_state: {
+          html: {
+            attrs: Object.fromEntries(Array.from(document.documentElement.attributes || []).map((attr) => [attr.name, attr.value])),
+            className: document.documentElement.className || "",
+            lang: document.documentElement.lang || "",
+            styles: htmlStyles
+          },
+          body: document.body
+            ? {
+                attrs: Object.fromEntries(Array.from(document.body.attributes || []).map((attr) => [attr.name, attr.value])),
+                className: document.body.className || "",
+                styles: bodyStyles
+              }
+            : null
+        },
         css_data: cssData,
         assets,
+        image_metrics: imageMetrics,
+        background_metrics: backgroundMetrics,
+        pseudo_elements: pseudoElements,
         favicon: {
           icons,
           theme_color: document.querySelector('meta[name="theme-color"]')?.getAttribute("content") || null,
@@ -290,6 +531,7 @@ async function extractPage(browser, url, viewportName, viewport, options) {
         motion_data: {
           candidates: motionCandidates.map((element, index) => ({
             index,
+            element_id: element.getAttribute("data-web-clone-id") || "",
             tag: element.tagName.toLowerCase(),
             className: typeof element.className === "string" ? element.className : "",
             id: element.id || "",
@@ -320,6 +562,8 @@ async function extractPage(browser, url, viewportName, viewport, options) {
     { maxDepth: options.maxDepth }
   );
 
+  const interactionSamples = await collectInteractionSamples(page);
+
   for (const sheet of extracted.css_data.stylesheets) {
     if (options.noFetchCss || sheet.content || !sheet.url) continue;
     try {
@@ -336,13 +580,18 @@ async function extractPage(browser, url, viewportName, viewport, options) {
     metadata: extracted.metadata,
     dom_tree: extracted.dom_tree,
     raw_html: normalizeHtmlUrls(extracted.raw_html, url),
+    document_state: extracted.document_state,
     css_data: extracted.css_data,
     assets: dedupeAssets(extracted.assets, url),
+    image_metrics: extracted.image_metrics,
+    background_metrics: extracted.background_metrics,
+    pseudo_elements: extracted.pseudo_elements,
     favicon: extracted.favicon,
     motion_data: {
       ...extracted.motion_data,
       load_samples: loadSamples,
-      scroll_samples: scrollSamples
+      scroll_samples: scrollSamples,
+      interaction_samples: interactionSamples
     },
     components: extracted.components,
     page_metrics: extracted.page_metrics,

@@ -2,7 +2,7 @@
 
 Skill package for cloning single public webpages into local Vite React Tailwind apps with Playwright capture, asset mirroring, and visual verification for Codex, Claude Code, and Gemini.
 
-The workflow captures page structure, styles, assets, favicons, screenshots, and motion hints with Playwright; creates section contracts for the active coding agent; assembles a local app; and verifies the result across desktop, tablet, and mobile viewports.
+The workflow captures page structure, styles, assets, favicons, screenshots, and motion hints with Playwright; creates section contracts; assembles a local app; and verifies the result across desktop, tablet, and mobile viewports.
 
 ## Repository Overview
 
@@ -20,7 +20,7 @@ Typical use cases:
 
 - Cloning a single public webpage into a local Vite React Tailwind app
 - Capturing layout, CSS, assets, favicons, and motion hints for a page reconstruction task
-- Generating section contracts for agent-assisted component rebuilding
+- Generating section contracts for component rebuilding
 - Verifying desktop, tablet, and mobile fidelity before considering a clone complete
 
 ## Installation
@@ -52,7 +52,7 @@ sh "${CODEX_HOME:-$HOME/.codex}/skills/web-clone/setup.sh"
 Usage example:
 
 ```text
-Use $web-clone to clone a public URL into a local Vite React Tailwind app.
+Use $web-clone to clone https://www.example.com/ into a local Vite React Tailwind app.
 ```
 
 ### 2) CC (Claude Code)
@@ -75,7 +75,7 @@ cp -R web-clone .claude/skills/
 sh .claude/skills/web-clone/setup.sh
 ```
 
-In prompts, explicitly request this skill, for example: `Please use the web-clone skill to clone a public URL`.
+In prompts, explicitly request this skill, for example: `Please use the web-clone skill to clone https://www.example.com/`.
 
 ### 3) Gemini
 
@@ -87,12 +87,13 @@ cp -R web-clone "$HOME/.gemini/skills/"
 sh "$HOME/.gemini/skills/web-clone/setup.sh"
 ```
 
-Then ask concrete cloning tasks in Gemini, for example: `Use the web-clone skill to clone a public URL`.
+Then ask concrete cloning tasks in Gemini, for example: `Use the web-clone skill to clone https://www.example.com/`.
 
 ## Notes
 
 - The runtime requires Node.js, npm, network access for the target page, and a Chromium runtime installed by Playwright.
 - Generated apps, captured HTML, screenshots, mirrored third-party assets, and verification reports are local run artifacts.
+- The default workflow writes local run artifacts under a host-named directory, for example `$HOME/web-clone-runs/example.com`.
 - The skill is scoped to one public page. It does not crawl whole sites, recreate backend behavior, bypass authentication, or provide rights to third-party content.
 
 ## License

@@ -1,4 +1,4 @@
 interface:
   display_name: "Web Clone"
   short_description: "Clone one public page into a Vite React app"
-  default_prompt: "Use $web-clone to clone a public URL into a local Vite React Tailwind app."
+  default_prompt: "Use $web-clone to clone https://www.example.com/ into a local Vite React Tailwind app."
