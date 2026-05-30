@@ -1,0 +1,24 @@
+{
+  "name": "web-clone-skill",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "sh setup.sh",
+    "clone:prepare": "node scripts/prepare-clone.mjs",
+    "clone:contracts": "node scripts/create-contracts.mjs",
+    "clone:assemble": "node scripts/assemble-vite-app.mjs",
+    "clone:verify": "node scripts/verify-clone.mjs",
+    "test": "node scripts/test-web-clone.mjs",
+    "validate": "node scripts/test-web-clone.mjs",
+    "playwright:install": "playwright install chromium"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "pixelmatch": "^7.1.0",
+    "playwright": "^1.56.1",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {}
+}
