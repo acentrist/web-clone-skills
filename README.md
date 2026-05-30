@@ -4,6 +4,8 @@ Skill package for cloning single public webpages into local Vite React Tailwind 
 
 The workflow captures page structure, styles, assets, favicons, screenshots, and motion hints with Playwright; creates section contracts; assembles a local app; and verifies the result across desktop, tablet, and mobile viewports.
 
+<video src="./Demo.mp4" width="100%" controls></video>
+
 ## Repository Overview
 
 The package currently provides one skill:
