@@ -25,7 +25,14 @@ Typical use cases:
 
 ## Installation
 
-Assume you are in the repository root.
+Clone this package first, then run the copy commands from the cloned directory:
+
+```bash
+git clone https://github.com/acentrist/web-clone-skills.git
+cd web-clone-skills
+```
+
+If you already cloned it, run the install commands from that repository root. The path `./web-clone` must exist.
 
 ### 1) Codex
 
